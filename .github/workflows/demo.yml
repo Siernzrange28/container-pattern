@@ -1,0 +1,13 @@
+name: demo
+on: [push, pull_request]
+jobs:
+  demo:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: the one command
+        run: bash examples/demo.sh
