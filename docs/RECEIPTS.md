@@ -84,3 +84,23 @@ the definition of done has not been met yet.
 | Date | Runner | Machine | Result | Friction, verbatim |
 |------|--------|---------|--------|--------------------|
 | TBD | a stranger | not the owner's | pending | |
+
+## 5. Hosted runners (not a stranger, but not the owner's machine either)
+
+Every push and pull request runs the one command on two hosted runners the owner never touches
+(`.github/workflows/demo.yml`). A green check is a fresh-checkout run of `examples/demo.sh`.
+
+| Date (UTC) | Runner | Result | Run |
+|------------|--------|--------|-----|
+| 2026-09-04 | ubuntu-latest | exit 0, 8 s | actions/runs/33824358482/job/100873717824 |
+| 2026-09-04 | macos-latest (system bash) | exit 0, 12 s | actions/runs/33824358482/job/100873717612 |
+
+## 6. Pull requests through the check
+
+`main` accepts a merge only when both runners are green (branch protection, strict). One row per
+merged PR, the columns a maintainer needs to see whether the check is earning its place.
+Counted from `gh pr view <n> --json additions,deletions,changedFiles,commits,comments,createdAt,mergedAt`.
+
+| PR | Files | +/− | Commits after open | Review comments | Open → merge | Checks |
+|----|-------|-----|--------------------|-----------------|--------------|--------|
+| #1 | 1 | +13 / −0 | 0 | 0 | 48 s | 4 of 4 green |
