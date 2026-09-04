@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# relay-send — append ONE message to a peer's relay inbox.
+#
+# Append-only by contract: never truncates, never rewrites. The reader (bin/relay-read)
+# consumes by content hash, so re-sending the same message is harmless, and a message
+# that has not reached its ===END=== line yet is ignored until it does.
+#
+#   relay-send --from <me> --to <peer> --subject "<one line>" [--body "<text>"]
+#   printf 'multi\nline\n' | relay-send --from hub --to worker --subject "job 12"
+#
+# Wire format (exactly what relay-read parses):
+#   ---
+#   from: <sender>
+#   to: <recipient>
+#   time: <UTC ISO-8601>
+#   subject: <one line>
+#   ---
+#   <body>
+#   ===END===
+#
+# Bus root: $RELAY_ROOT (default ./.relay).  Inbox: $RELAY_ROOT/<to>/inbox.md
+set -euo pipefail
+
+from='' to='' subject='' body=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from)    from=${2:?relay-send: --from needs a value};       shift 2 ;;
+    --to)      to=${2:?relay-send: --to needs a value};           shift 2 ;;
+    --subject) subject=${2:?relay-send: --subject needs a value}; shift 2 ;;
+    --body)    body=${2:?relay-send: --body needs a value};       shift 2 ;;
+    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "relay-send: unknown argument: $1 (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+name='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+[[ $from =~ $name && $to =~ $name ]] || { echo "relay-send: --from and --to must be plain names (got '$from' -> '$to')" >&2; exit 2; }
+[[ -n $subject && $subject != *$'\n'* ]] || { echo "relay-send: --subject is required and must be one line" >&2; exit 2; }
+[ -n "$body" ] || [ -t 0 ] || body=$(cat)
+[ -n "$body" ] || { echo "relay-send: empty body (pass --body or pipe it on stdin)" >&2; exit 2; }
+if printf '%s\n' "$body" | grep -q '^===END==='; then
+  echo "relay-send: body may not contain a line starting with ===END=== (it is the message terminator)" >&2; exit 2
+fi
+
+root=${RELAY_ROOT:-./.relay}
+inbox="$root/$to/inbox.md"
+mkdir -p "$root/$to"
+msg=$(printf -- '---\nfrom: %s\nto: %s\ntime: %s\nsubject: %s\n---\n%s\n===END===' \
+  "$from" "$to" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$subject" "$body")
+# One write, message pre-built: a reader racing this append sees either nothing or a whole message.
+printf '%s\n' "$msg" >> "$inbox"
+echo "relay-send: $from -> $inbox ($(printf '%s\n' "$msg" | wc -c | tr -d ' ') bytes)"

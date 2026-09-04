@@ -1,0 +1,26 @@
+{
+  "_readme": [
+    "Runners for bin/dispatch. One entry per seat. `command` is ONE line of shell, run as `bash -c`",
+    "with the prompt on stdin and in $DISPATCH_PROMPT_FILE; non-interactive only, there is no tty.",
+    "Copy this file, point $DISPATCH_RUNNERS at the copy, swap the placeholders for CLIs you have.",
+    "timeout_sec = wall-clock kill, budget_bytes = output cap; unset fields fall back to `defaults`."
+  ],
+  "defaults": { "timeout_sec": 300, "budget_bytes": 200000, "max_depth": 2 },
+  "runners": {
+    "stub": {
+      "description": "No model at all: echoes the prompt back. Proves file, sentinel, deadline, digest with nothing installed.",
+      "command": "cat"
+    },
+    "cli": {
+      "description": "Any agent CLI in print mode. Replace the placeholder, e.g. `your-agent-cli -p \"$(cat \"$DISPATCH_PROMPT_FILE\")\"`.",
+      "command": "your-agent-cli --print \"$(cat \"$DISPATCH_PROMPT_FILE\")\"",
+      "timeout_sec": 900
+    },
+    "local": {
+      "description": "A local model through ollama, prompt on stdin. Swap the model tag for one you have pulled.",
+      "command": "ollama run llama3.2",
+      "timeout_sec": 600,
+      "budget_bytes": 50000
+    }
+  }
+}

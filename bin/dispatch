@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# dispatch — hand ONE job to ONE runner; get a report file back, never a stream.
+#
+# The contract, identical for every runner:
+#   file      the runner's output lands in <out>/<job>/report.md; nothing reaches the caller's tty
+#   sentinel  the LAST line of report.md is `===DONE=== <STATUS>`, written by dispatch after the
+#             runner has exited, and nothing is ever written after it. Wait on the sentinel, not
+#             on a pid: "the process is running" is not success.
+#   deadline  wall-clock kill after timeout_sec (TERM, then KILL 5s later)      -> STATUS TIMEOUT
+#   budget    output cap in bytes, the one currency every runner shares         -> STATUS OVER_BUDGET
+#   depth     a job may dispatch jobs; DISPATCH_DEPTH grows by one per level and dispatch refuses
+#             above max_depth, so agents cannot fork agents forever
+#   digest    one line per finished job goes to the digest (bin/digest), prefixed FAILED: unless OK
+#
+#   dispatch [run] --runner <name> [--job <id>] [--timeout <sec>] [--budget <bytes>] [--notify <seat>]
+#                  [--bg] [--no-digest] [--runners <file>] ("<prompt>" | --prompt-file <f> | stdin)
+#   dispatch status <job> [--wait <sec>]   print "<job> <STATUS>"; exit 0 = done, 1 = still running
+#   dispatch runners                       list the runners in the runners file
+#
+# Exit (run): 0 = STATUS OK, 1 = report written but STATUS is not OK, 2 = usage/config, no report.
+# --bg prints the job id and returns at once; poll with `dispatch status <job> --wait <sec>`.
+#
+# Paths:
+#   runners  --runners <f>, else $DISPATCH_RUNNERS, else <this dir>/../examples/runners.example.json
+#   out      $DISPATCH_OUT  default ./dispatch-out      job dir = <out>/<job>/
+#   digest   $DIGEST_FILE   default <out>/DIGEST.md     (bin/digest owns the format)
+#   notify   --notify <seat> also sends the report path over the relay (bin/relay-send)
+# The runner is `bash -c "<command>"` with the prompt on stdin and in $DISPATCH_PROMPT_FILE, plus
+# DISPATCH_JOB, DISPATCH_JOB_DIR, DISPATCH_RUNNER, DISPATCH_DEPTH, DISPATCH_RUNNERS, DISPATCH_OUT.
+set -euo pipefail
+bindir=$(cd "$(dirname "$0")" && pwd)
+
+cmd=run runner='' job='' timeout='' budget='' notify='' bg=0 digest=1 prompt='' pfile='' rfile='' wait_s=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    run|status|runners) cmd=$1; shift ;;
+    --runner)      runner=${2:?dispatch: --runner needs a name}; shift 2 ;;
+    --runners)     rfile=${2:?dispatch: --runners needs a file}; shift 2 ;;
+    --job)         job=${2:?dispatch: --job needs an id}; shift 2 ;;
+    --timeout)     timeout=${2:?dispatch: --timeout needs seconds}; shift 2 ;;
+    --budget)      budget=${2:?dispatch: --budget needs bytes}; shift 2 ;;
+    --notify)      notify=${2:?dispatch: --notify needs a seat}; shift 2 ;;
+    --prompt-file) pfile=${2:?dispatch: --prompt-file needs a file}; shift 2 ;;
+    --wait)        wait_s=${2:?dispatch: --wait needs seconds}; shift 2 ;;
+    --bg)          bg=1; shift ;;
+    --no-digest)   digest=0; shift ;;
+    -h|--help)     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "dispatch: unknown argument: $1 (try --help)" >&2; exit 2 ;;
+    *) if   [ "$cmd" = status ] && [ -z "$job" ];    then job=$1
+       elif [ "$cmd" = run ]    && [ -z "$prompt" ]; then prompt=$1
+       else echo "dispatch: unexpected argument: $1 (try --help)" >&2; exit 2; fi; shift ;;
+  esac
+done
+name='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+num='^[0-9]+$'
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+json_str() {  # escape one string for a JSON value
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\t'/\\t}; s=${s//$'\r'/\\r}
+  printf '"%s"' "$s"
+}
+
+out=${DISPATCH_OUT:-./dispatch-out}
+mkdir -p "$out"; out=$(cd "$out" && pwd)   # absolute: runners may cd, nested jobs must find the tree
+
+# ---- status: read the sentinel, never the process table --------------------------------------
+job_status() {  # prints STATUS, or RUNNING while the sentinel is absent; 2 = no such job
+  [ -e "$out/$1" ] || { echo "dispatch: no job '$1' under $out" >&2; return 2; }
+  local last; last=$(tail -n 1 "$out/$1/report.md" 2>/dev/null || true)
+  case "$last" in '===DONE=== '*) echo "${last#===DONE=== }" ;; *) echo RUNNING ;; esac
+}
+if [ "$cmd" = status ]; then
+  [[ $job =~ $name ]] || { echo "dispatch: status needs a job id" >&2; exit 2; }
+  [[ $wait_s =~ $num ]] || { echo "dispatch: --wait must be seconds (got '$wait_s')" >&2; exit 2; }
+  deadline=$(( $(date +%s) + wait_s ))
+  while :; do
+    s=$(job_status "$job") || exit 2
+    if [ "$s" = RUNNING ] && [ "$(date +%s)" -lt "$deadline" ]; then sleep 1; continue; fi
+    echo "$job $s"
+    [ "$s" = RUNNING ] && exit 1; exit 0
+  done
+fi
+
+# ---- runners file: flatten the JSON once to "dotted.key<TAB>value" lines, then grep --------------
+rfile=${rfile:-${DISPATCH_RUNNERS:-$bindir/../examples/runners.example.json}}
+[ -f "$rfile" ] || { echo "dispatch: no runners file at $rfile (see examples/runners.example.json)" >&2; exit 2; }
+rfile=$(cd "$(dirname "$rfile")" && pwd)/$(basename "$rfile")
+flatten() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -r 'paths(scalars) as $p | "\($p | map(tostring) | join("."))\t\(getpath($p))"' "$1"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$1" <<'PY'
+import json, sys
+def walk(v, p):
+    if isinstance(v, dict):
+        for k, x in v.items(): walk(x, p + [k])
+    elif isinstance(v, list):
+        for i, x in enumerate(v): walk(x, p + [str(i)])
+    else:
+        print(".".join(p) + "\t" + (json.dumps(v) if isinstance(v, bool) or v is None else str(v)))
+walk(json.load(open(sys.argv[1])), [])
+PY
+  else
+    echo "dispatch: need jq or python3 to read $1" >&2; return 2
+  fi
+}
+flat=$(flatten "$rfile") || { echo "dispatch: cannot parse $rfile" >&2; exit 2; }
+cfg() { printf '%s\n' "$flat" | awk -F'\t' -v k="$1" '$1 == k { sub(/^[^\t]*\t/, ""); print; exit }'; }
+list_runners() {
+  printf '%s\n' "$flat" | awk -F'\t' '$1 ~ /^runners\.[^.]+\.command$/ {
+    n = $1; sub(/^runners\./, "", n); sub(/\.command$/, "", n); print n }'
+}
+if [ "$cmd" = runners ]; then
+  list_runners | while IFS= read -r r; do
+    printf '%-8s %s\n         $ %s\n' "$r" "$(cfg "runners.$r.description")" "$(cfg "runners.$r.command")"
+  done
+  exit 0
+fi
+
+# ---- run: resolve the job -----------------------------------------------------------------------
+[[ $runner =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { echo "dispatch: --runner <name> is required (see: dispatch runners)" >&2; exit 2; }
+command_t=$(cfg "runners.$runner.command")
+[ -n "$command_t" ] || { echo "dispatch: no runner '$runner' in $rfile (have: $(list_runners | tr '\n' ' '))" >&2; exit 2; }
+timeout=${timeout:-$(cfg "runners.$runner.timeout_sec")};  timeout=${timeout:-$(cfg defaults.timeout_sec)};  timeout=${timeout:-300}
+budget=${budget:-$(cfg "runners.$runner.budget_bytes")};   budget=${budget:-$(cfg defaults.budget_bytes)};   budget=${budget:-200000}
+max_depth=$(cfg defaults.max_depth); max_depth=${max_depth:-2}
+depth=${DISPATCH_DEPTH:-0}
+for v in timeout budget max_depth depth; do
+  [[ ${!v} =~ $num ]] || { echo "dispatch: $v must be a whole number (got '${!v}')" >&2; exit 2; }
+done
+[ "$timeout" -gt 0 ] && [ "$budget" -gt 0 ] || { echo "dispatch: timeout and budget must be > 0" >&2; exit 2; }
+[ $((depth + 1)) -le "$max_depth" ] || {
+  echo "dispatch: refusing: this job would run at depth $((depth + 1)) > max_depth $max_depth (DISPATCH_DEPTH=$depth)" >&2; exit 2; }
+[ -z "$notify" ] || [[ $notify =~ $name ]] || { echo "dispatch: --notify must be a plain seat name (got '$notify')" >&2; exit 2; }
+
+[ -z "$pfile" ] || prompt=$(cat "$pfile")
+[ -n "$prompt" ] || [ -t 0 ] || prompt=$(cat)
+[ -n "$prompt" ] || { echo "dispatch: empty prompt (pass it as an argument, --prompt-file, or on stdin)" >&2; exit 2; }
+
+[ -n "$job" ] || job="$(date -u +%Y%m%dT%H%M%SZ)-$runner-$(printf '%04x' "$RANDOM")"
+[[ $job =~ $name ]] || { echo "dispatch: --job must be a plain name (got '$job')" >&2; exit 2; }
+jobdir="$out/$job"; report="$jobdir/report.md"
+[ ! -e "$jobdir" ] || { echo "dispatch: job '$job' already exists at $jobdir" >&2; exit 2; }
+mkdir -p "$jobdir"
+printf '%s\n' "$prompt" > "$jobdir/prompt.md"
+started=$(now); t0=$(date +%s)
+printf '# job %s\nrunner: %s\ncommand: %s\ndepth: %s\ntimeout_sec: %s\nbudget_bytes: %s\nstarted: %s\n---\n' \
+  "$job" "$runner" "$command_t" "$((depth + 1))" "$timeout" "$budget" "$started" > "$report"
+export DISPATCH_JOB=$job DISPATCH_JOB_DIR=$jobdir DISPATCH_PROMPT_FILE=$jobdir/prompt.md \
+       DISPATCH_RUNNER=$runner DISPATCH_DEPTH=$((depth + 1)) DISPATCH_RUNNERS=$rfile DISPATCH_OUT=$out
+
+# ---- run: the deadline, the budget, the sentinel ------------------------------------------------
+tmo=''; for c in timeout gtimeout; do command -v "$c" >/dev/null 2>&1 && { tmo=$c; break; }; done
+run_runner() {  # prompt on stdin, output on stdout; exit 124 when the deadline killed it
+  if [ -n "$tmo" ]; then "$tmo" -k 5 "$timeout" bash -c "$command_t"; return $?; fi
+  # No timeout(1) on this machine (macOS without coreutils): a bash watchdog kills the child.
+  bash -c "$command_t" <&0 & local pid=$!
+  ( for ((i = 0; i < timeout; i++)); do kill -0 "$pid" 2>/dev/null || exit 0; sleep 1; done
+    touch "$jobdir/.deadline"; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) &
+  local wd=$! rc=0
+  wait "$pid" || rc=$?
+  wait "$wd" 2>/dev/null || true
+  [ -e "$jobdir/.deadline" ] && { rm -f "$jobdir/.deadline"; return 124; }
+  return "$rc"
+}
+run_job() {
+  local rc=0 bytes secs status
+  run_runner < "$jobdir/prompt.md" 2> "$jobdir/stderr.log" | head -c "$((budget + 1))" > "$jobdir/.output" \
+    || rc=${PIPESTATUS[0]}
+  bytes=$(wc -c < "$jobdir/.output" | tr -d ' ')
+  head -c "$budget" "$jobdir/.output" >> "$report"; rm -f "$jobdir/.output"
+  [ "$bytes" = 0 ] || [ "$(tail -c 1 "$report" | wc -l | tr -d ' ')" = 1 ] || echo >> "$report"
+  secs=$(( $(date +%s) - t0 ))
+  if   [ "$rc" = 124 ] || [ "$rc" = 137 ]; then status=TIMEOUT        # 137 = timeout(1) had to KILL
+  elif [ "$bytes" -gt "$budget" ];         then status=OVER_BUDGET; bytes=$budget
+  elif [ "$rc" = 0 ];                      then status=OK
+  else                                          status=FAILED; fi
+  if [ "$status" != OK ] && [ -s "$jobdir/stderr.log" ]; then   # errors go back verbatim, never swallowed
+    printf -- '--- stderr (last 20 lines)\n' >> "$report"; tail -n 20 "$jobdir/stderr.log" >> "$report"
+  fi
+  printf '{"job":%s,"runner":%s,"command":%s,"status":"%s","exit":%s,"bytes":%s,"budget_bytes":%s,"timeout_sec":%s,"seconds":%s,"depth":%s,"started":"%s","finished":"%s","report":%s}\n' \
+    "$(json_str "$job")" "$(json_str "$runner")" "$(json_str "$command_t")" "$status" "$rc" "$bytes" "$budget" \
+    "$timeout" "$secs" "$((depth + 1))" "$started" "$(now)" "$(json_str "$report")" > "$jobdir/meta.json"
+  # Footer and sentinel in ONE write; the sentinel is the last line and nothing follows it.
+  printf -- '---\nstatus: %s\nexit: %s\nbytes: %s\nseconds: %s\nfinished: %s\n===DONE=== %s\n' \
+    "$status" "$rc" "$bytes" "$secs" "$(now)" "$status" >> "$report"
+  if [ "$digest" = 1 ]; then
+    export DIGEST_FILE=${DIGEST_FILE:-$out/DIGEST.md}
+    local line="job $job $status runner=$runner ${secs}s ${bytes}B -> $report"
+    [ "$status" = OK ] || line="FAILED: $line"
+    "$bindir/digest" post --as "${DISPATCH_SEAT:-dispatch}" "$line" >/dev/null || echo "dispatch: digest post failed" >&2
+  fi
+  if [ -n "$notify" ]; then
+    printf 'report: %s\n%s\n' "$report" "$(tail -n 7 "$report")" |
+      "$bindir/relay-send" --from "${DISPATCH_SEAT:-dispatch}" --to "$notify" --subject "job $job $status" >/dev/null \
+      || echo "dispatch: relay-send to $notify failed" >&2
+  fi
+  echo "$report"
+  [ "$status" = OK ]
+}
+if [ "$bg" = 1 ]; then
+  ( run_job ) < /dev/null > "$jobdir/dispatch.log" 2>&1 &
+  echo "$job"; exit 0
+fi
+run_job

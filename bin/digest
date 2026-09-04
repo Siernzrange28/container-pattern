@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# digest — the shared one-line-per-event log, with read receipts.
+#
+# A digest line is a claim ("job 12 done", "FAILED: nightly backup"). A receipt is proof
+# that a seat actually read it. Both are append-only files on the shared bus, so "who has
+# seen what" is answered from disk, never from memory. Silence in the digest is not
+# success: a line that says FAILED needs a seat or a human to act on it.
+#
+#   digest [-n N] [--as <seat>]        print the last N lines (default 20), log a read receipt
+#   digest --no-receipt [-n N]         same, log nothing (for humans and monitors)
+#   digest post [--as <seat>] "<line>" append one dated, attributed line (or pipe it on stdin)
+#   digest who                         per seat: last read, lines seen, how far behind now
+#
+# Exit: 0 = printed or posted something, 1 = nothing to show, 2 = bad usage.
+#
+# Paths:
+#   digest    $DIGEST_FILE      default ./DIGEST.md
+#   receipts  $DIGEST_RECEIPTS  default <digest dir>/digest-reads.jsonl
+# Seat name: --as <seat>, else $DIGEST_SEAT, else $USER. Plain names only.
+set -euo pipefail
+
+cmd=read n=20 seat=${DIGEST_SEAT:-${USER:-anon}} receipt=1 msg=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    post|who)     cmd=$1; shift ;;
+    -n)           n=${2:?digest: -n needs a number}; shift 2 ;;
+    --as)         seat=${2:?digest: --as needs a value}; shift 2 ;;
+    --no-receipt) receipt=0; shift ;;
+    -h|--help)    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)           echo "digest: unknown argument: $1 (try --help)" >&2; exit 2 ;;
+    *) if [ "$cmd" = post ] && [ -z "$msg" ]; then msg=$1; shift
+       else echo "digest: unexpected argument: $1 (try --help)" >&2; exit 2; fi ;;
+  esac
+done
+[[ $seat =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "digest: seat must be a plain name (got '$seat')" >&2; exit 2; }
+[[ $n =~ ^[0-9]+$ ]] || { echo "digest: -n must be a number (got '$n')" >&2; exit 2; }
+
+file=${DIGEST_FILE:-./DIGEST.md}
+receipts=${DIGEST_RECEIPTS:-$(dirname "$file")/digest-reads.jsonl}
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+hash_of() {  # sha256 hex of stdin; GNU, BSD/macOS, then openssl
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -c1-64
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -c1-64
+  else openssl dgst -sha256 | sed 's/^.*= *//'
+  fi
+}
+# Current state of the digest: line count and a short hash of the last line.
+state() {
+  lines=0 head=-
+  [ -s "$file" ] || return 0
+  lines=$(wc -l < "$file" | tr -d ' ')
+  head=$(tail -n 1 "$file" | hash_of | cut -c1-12)
+}
+
+case "$cmd" in
+  post)
+    [ -n "$msg" ] || [ -t 0 ] || msg=$(cat)
+    msg=${msg%$'\n'}
+    [ -n "$msg" ] || { echo "digest: empty line (pass it as an argument or pipe it on stdin)" >&2; exit 2; }
+    [[ $msg != *$'\n'* ]] || { echo "digest: one line per post (got a newline; post twice instead)" >&2; exit 2; }
+    mkdir -p "$(dirname "$file")"
+    # One write, line pre-built: a reader racing this append sees either nothing or the whole line.
+    printf -- '- %s [%s] %s\n' "$(now)" "$seat" "$msg" >> "$file"
+    echo "digest: posted as $seat -> $file"
+    ;;
+  read)
+    [ -s "$file" ] || { echo "digest: nothing in $file yet (digest post \"...\" writes the first line)" >&2; exit 1; }
+    shown=$(tail -n "$n" "$file")
+    printf '%s\n' "$shown"
+    failed=$(printf '%s\n' "$shown" | grep -c 'FAILED' || true)
+    [ "$failed" = 0 ] || echo "digest: $failed line(s) marked FAILED above; silence is not success" >&2
+    if [ "$receipt" = 1 ]; then
+      state
+      mkdir -p "$(dirname "$receipts")"
+      printf '{"time":"%s","seat":"%s","lines":%s,"head":"%s"}\n' "$(now)" "$seat" "$lines" "$head" >> "$receipts"
+    fi
+    ;;
+  who)
+    [ -s "$receipts" ] || { echo "digest: no receipts at $receipts (nobody has read $file)" >&2; exit 1; }
+    state
+    # Last receipt per seat, compared with the digest as it is right now.
+    awk -F'"' -v L="$lines" -v H="$head" '
+      NF >= 14 { v = $11; gsub(/[^0-9]/, "", v); t[$8] = $4; n[$8] = v + 0; h[$8] = $14 }
+      END {
+        for (s in t) {
+          if (h[s] == H)      st = "current"
+          else if (n[s] < L)  st = (L - n[s]) " behind"
+          else                st = "stale (digest rewritten since)"
+          printf "%-12s %-20s %6s  %s\n", s, t[s], n[s] "/" L, st
+        }
+      }' "$receipts" | sort
+    ;;
+esac

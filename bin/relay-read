@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# relay-read — consume messages from MY relay inbox, by content hash.
+#
+# The inbox is append-only and is never rewritten by anyone, including this reader.
+# "Consumed" lives in a separate ledger: one sha256 per delivered message. A message is
+# unread iff its hash is not in the ledger, so a duplicate frame is delivered once and a
+# message that has not reached its ===END=== line yet is ignored until it does.
+#
+#   relay-read --as <me>            print unread messages, then mark them consumed
+#   relay-read --as <me> --peek     print unread messages, mark nothing
+#   relay-read --as <me> --all      print every complete message, consumed or not
+#   relay-read --as <me> --count    print the number of unread messages, mark nothing
+#   relay-read --as <me> --json     one JSON object per message instead of the frame
+#
+# Exit: 0 = printed at least one message, 1 = nothing to print, 2 = bad usage.
+# (--count always exits 0.) A partial trailing message is reported on stderr only.
+#
+# Paths:
+#   inbox   $RELAY_ROOT/<me>/inbox.md          RELAY_ROOT default ./.relay
+#   ledger  $RELAY_LEDGER                       default ${XDG_STATE_HOME:-~/.local/state}/relay/<me>.seen
+# The ledger is deliberately OUTSIDE the bus: a bus may be synced between machines,
+# but what a given reader has consumed is local state.
+set -euo pipefail
+
+me='' mode=print mark=1 json=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --as)      me=${2:?relay-read: --as needs a value}; shift 2 ;;
+    --peek)    mark=0; shift ;;
+    --all)     mode=all; shift ;;
+    --count)   mode=count; mark=0; shift ;;
+    --json)    json=1; shift ;;
+    -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "relay-read: unknown argument: $1 (try --help)" >&2; exit 2 ;;
+  esac
+done
+[[ $me =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "relay-read: --as must be a plain name (got '$me')" >&2; exit 2; }
+
+root=${RELAY_ROOT:-./.relay}
+inbox="$root/$me/inbox.md"
+ledger=${RELAY_LEDGER:-${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/relay/$me.seen}
+
+hash_of() {  # sha256 hex of stdin; GNU, BSD/macOS, then openssl
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -c1-64
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -c1-64
+  else openssl dgst -sha256 | sed 's/^.*= *//'
+  fi
+}
+json_str() {  # escape one string for a JSON value
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\t'/\\t}; s=${s//$'\r'/\\r}
+  printf '"%s"' "$s"
+}
+
+if [ ! -f "$inbox" ]; then
+  echo "relay-read: no inbox at $inbox" >&2
+  [ "$mode" = count ] && { echo 0; exit 0; }
+  exit 1
+fi
+seen=''
+[ -f "$ledger" ] && seen=$(cat "$ledger")
+
+# One pass over the inbox. state 0 = between messages, 1 = in header, 2 = in body.
+state=0 raw='' body='' from='' to='' time='' subject='' shown=0 unread=0
+newly=''
+emit() {
+  local id
+  id=$(printf '%s' "$raw" | hash_of)
+  local consumed=0
+  case "$seen" in *"$id"*) consumed=1 ;; esac
+  [ "$consumed" = 0 ] && unread=$((unread + 1))
+  [ "$mode" = count ] && return 0
+  [ "$mode" = print ] && [ "$consumed" = 1 ] && return 0
+  if [ "$json" = 1 ]; then
+    printf '{"id":%s,"from":%s,"to":%s,"time":%s,"subject":%s,"body":%s,"consumed":%s}\n' \
+      "$(json_str "${id:0:12}")" "$(json_str "$from")" "$(json_str "$to")" "$(json_str "$time")" \
+      "$(json_str "$subject")" "$(json_str "${body%$'\n'}")" "$([ "$consumed" = 1 ] && echo true || echo false)"
+  else
+    printf -- '--- id: %s%s\n' "${id:0:12}" "$([ "$consumed" = 1 ] && printf ' (consumed)')"
+    printf '%s' "$raw"
+  fi
+  shown=$((shown + 1))
+  [ "$consumed" = 0 ] && newly="$newly$id"$'\n'
+  return 0
+}
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$state" in
+    0) [ "$line" = '---' ] || continue
+       state=1 raw="$line"$'\n' body='' from='' to='' time='' subject='' ;;
+    1) raw="$raw$line"$'\n'
+       case "$line" in
+         ---) state=2 ;;
+         from:*)    from=${line#from:};       from=${from# } ;;
+         to:*)      to=${line#to:};           to=${to# } ;;
+         time:*)    time=${line#time:};       time=${time# } ;;
+         subject:*) subject=${line#subject:}; subject=${subject# } ;;
+       esac ;;
+    2) raw="$raw$line"$'\n'
+       if [ "$line" = '===END===' ]; then emit; state=0; else body="$body$line"$'\n'; fi ;;
+  esac
+done < "$inbox"
+[ "$state" = 0 ] || echo "relay-read: 1 incomplete message pending in $inbox (no ===END=== yet)" >&2
+
+if [ "$mode" = count ]; then echo "$unread"; exit 0; fi
+if [ "$mark" = 1 ] && [ -n "$newly" ]; then
+  mkdir -p "$(dirname "$ledger")"
+  printf '%s' "$newly" >> "$ledger"   # append-only, one write: never rewrites earlier hashes
+fi
+[ "$shown" -gt 0 ]
