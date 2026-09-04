@@ -83,7 +83,14 @@ the definition of done has not been met yet.
 
 | Date | Runner | Machine | Result | Friction, verbatim |
 |------|--------|---------|--------|--------------------|
-| TBD | a stranger | not the owner's | pending | |
+| 2026-09-04 | Grok Bot, given only the URL | cloud Linux VM, bash 5.2.37, not the owner's | exit 0 | none |
+
+Notes the stranger left after reading the docs (verbatim, one per doc; not friction, kept as candidates):
+- CONTAINER.md: "DIGEST_FILE defaults to ./DIGEST.md and dispatch defaults to <out>/DIGEST.md" is a landmine unless you already ran the demo.
+- CONTRACTS.md: depth limit and byte budget feel under-motivated without a failed-run example in the doc itself.
+- DOCTRINE.md: attic/never-delete is asserted without a demo step that forces a retirement.
+- RECEIPTS.md: the private-instance numbers cannot be verified from this public clone, only asserted.
+- Reuse: "Yes for a local two-seat bus on one machine; the hard part is waking on inbound notices, which this pattern does not solve by itself."
 
 ## 5. Hosted runners (not a stranger, but not the owner's machine either)
 
