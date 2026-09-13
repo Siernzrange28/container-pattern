@@ -1,5 +1,9 @@
 # The container pattern
 
+**What this proves:** several agent processes can hand work to each other through plain files and leave proof on disk, with no server, model, or network.
+**Who ran it:** a first-time user with only the URL, on a cloud Linux VM, from the README, exit 0, zero friction ([docs/RECEIPTS.md](docs/RECEIPTS.md)).
+**Receipts:** CI runs the one-command demo on Ubuntu and macOS on every change; main is protected; every claim the demo makes is checked against the files it wrote.
+
 **The harness is water. The container is the thing.**
 
 Models, agent CLIs, and cloud seats change every few months. What lasts is the *container*
